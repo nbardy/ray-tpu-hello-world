@@ -3,7 +3,7 @@ cluster_name: default
 
 # The maximum number of workers nodes to launch in addition to the head
 # node.
-max_workers: 512
+max_workers: 513
 
 # The autoscaler will scale up the cluster faster with higher upscaling speed.
 # E.g., if the task requires adding more nodes then autoscaler will gradually
@@ -37,8 +37,8 @@ idle_timeout_minutes: 5
 # Cloud-provider specific configuration.
 provider:
     type: gcp
-    region: us-central1
-    availability_zone: us-central1-a
+    region: us-central2
+    availability_zone: us-central2-b
     project_id: facet-250518
 
 # How Ray will authenticate with newly launched nodes.
@@ -90,10 +90,10 @@ available_node_types:
     ray_tpu:
         min_workers: 1
         max_workers: 512
-        resources: {"TPU": 1}  # use TPU custom resource in your code
+        resources: {"TPU": 8}  # use TPU custom resource in your code
         node_config:
             acceleratorType: v4-8
-            runtimeVersion: v2-alpha
+            runtimeVersion: tpu-vm-v4-pt-2.0
             schedulingConfig:
                 preemptible: true
            
