@@ -1,3 +1,5 @@
+import logging
+import shutil
 from rich.console import Group
 import re
 from rich.table import Table
@@ -39,6 +41,50 @@ def run_command(cmd, retries=5):
     raise Exception(f"Failed to run command: {cmd}, error: {stderr}")
 
 
+# Create a logger
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+def run_command_log(cmd, label=None, machine_id=None, retries=1):
+    os.makedirs("machine_ups", exist_ok=True)
+    os.makedirs("latest", exist_ok=True)
+
+    log_file_path = f"machine_ups/{machine_id}.log"
+    print(f"Running command: {label}")
+    print("Logging to: ", log_file_path)
+    print("Command: ", cmd)
+
+    while retries:
+        process = subprocess.Popen(
+            cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+        with open(log_file_path, 'a') as log_file:
+            while True:
+                output = process.stdout.readline()
+                if output == b'' and process.poll() is not None:
+                    break
+                if output:
+                    print(output.strip().decode())
+                    log_file.write(output.decode())
+
+        if process.poll() == 0:
+            # copy log file to latest folder
+            shutil.copy2(log_file_path, "latest/")
+            return process.stdout
+        else:
+            print(
+                f"Failed to run command: {cmd}, retrying...")
+            retries -= 1
+            time.sleep(5)
+
+    # copy log file to latest folder
+    shutil.copy2(log_file_path, "latest/")
+    raise Exception(f"Failed to run command: {cmd}")
+
+
+# updated launch_node function
+
 def launch_node():
     # Make uuid for machine-id of 6 characters
     machine_id = run_command("uuidgen | cut -c1-6").decode('utf-8').strip()
@@ -46,28 +92,42 @@ def launch_node():
     queued_resource_id = os.environ['QUEUED_RESOURCE_ID'] + machine_id
     tpu_name = os.environ['TPU_NAME'] + machine_id
 
-    cmd = """
-    gcloud config set compute/zone $ZONE
+    # break into many commands
+    set_config = f"gcloud config set compute/zone {os.environ['ZONE']} --quiet"
+    run_command_log(set_config, label="Set config", machine_id=machine_id)
 
-    gcloud alpha compute tpus tpu-vm delete $TPU_NAME --zone ${ZONE} --project ${PROJECT_ID}
+    delete_tpu_vm = f"gcloud alpha compute tpus tpu-vm delete {tpu_name} --zone {os.environ['ZONE']} --project {os.environ['PROJECT_ID']} --quiet"
+    try:
+        run_command_log(delete_tpu_vm, label="Delete TPU VM",
+                        machine_id=machine_id)
+    except Exception as e:
+        print(e)
 
-    gcloud alpha compute tpus queued-resources delete ${queued_resource_id} \
-    --project ${PROJECT_ID} \
-    --zone ${ZONE}
-
-    gcloud alpha compute tpus queued-resources create ${queued_resource_id} \
-    --project ${PROJECT_ID} \
-    --node-id ${tpu_name} \
-    --zone ${ZONE} \
-    --accelerator-type ${ACCELERATOR_TYPE} \
-    --runtime-version ${RUNTIME_VERSION}
+    delete_queued_resource = f"""
+    gcloud alpha compute tpus queued-resources delete {queued_resource_id} \
+    --project {os.environ['PROJECT_ID']} \
+    --zone {os.environ['ZONE']}
+    --quiet \
     """
 
+    # This one can fail if it doesn't exist that's ok
     try:
-        run_command(cmd)
-    except Exception as err:
-        print(f"Failed to launch node: {err}")
-        return None
+        run_command_log(delete_queued_resource, label="Delete Queued Resource",
+                        machine_id=machine_id)
+    except Exception as e:
+        print(e)
+
+    create_queued_resource = f"""
+    gcloud alpha compute tpus queued-resources create {queued_resource_id} \
+    --project {os.environ['PROJECT_ID']} \
+    --node-id {tpu_name} \
+    --zone {os.environ['ZONE']} \
+    --accelerator-type {os.environ['ACCELERATOR_TYPE']} \
+    --runtime-version {os.environ['RUNTIME_VERSION']} \
+    --quiet \
+    """
+    run_command_log(create_queued_resource, label="Create Queued Resource",
+                    machine_id=machine_id)
 
     return machine_id
 
@@ -109,64 +169,52 @@ def start_ray_on_child(head_node_ip, zone=None, instance=None):
         )
 
     cmd = f"""
-    ray start --address={head_node_ip}:6379 --resources='{"TPU": 4}' --node-ip-address=$(curl -H Metadata-Flavor:Google http://metadata/computeMetadata/v1/instance/network-interfaces/0/ip)
+    ray start - -address = {head_node_ip}: 6379 - -resources = '{"TPU": 4}' - -node-ip-address =$(curl - H Metadata-Flavor: Google http: // metadata/computeMetadata/v1/instance/network-interfaces/0/ip)
     """
     return run_command_on_gcloud(cmd, zone=zone, instance=instance)
 
 
 def check_node_status():
-    cmd = "ray status"
-    stdout = run_command(cmd)
-    return json.loads(stdout)
+    import ray
+    return ray.nodes()
 
 
-def get_machine_state(machine_name):
-    # Check the machine status on GCP
-    request = compute.instances().get(
-        project=os.environ['PROJECT_ID'],
-        zone=os.environ['ZONE'],
-        instance=machine_name)
-    try:
-        response = request.execute()
-        return response
-    except HttpError as err:
-        print(f"Failed to get machine state from GCP: {err}")
-        return None
-
-
-def get_node_count_gcp():
-    request = compute.instances().list(
-        project=os.environ['PROJECT_ID'],
-        zone=os.environ['ZONE'])
-    try:
-        response = request.execute()
-        return len(response['items'])
-    except HttpError as err:
-        print(f"Failed to get machine state from GCP: {err}")
-        return 0
-
-
-def get_instance_status(zone, instance):
-    cmd = ["gcloud", "compute", "instances", "describe",
-           instance, "--zone", zone, "--format=json"]
+def all_tpu_status(zone):
+    cmd = ["gcloud", "alpha", "compute", "tpus", "tpu-vm",
+           "list", "--zone", zone, "--format=json"]
 
     result = subprocess.run(cmd, text=True, capture_output=True)
 
-    # Check if the command was successful
     if result.returncode != 0:
         print(f"Error running command: {result.stderr}")
         return None
 
-    # Parse the output as JSON
-    instance_info = json.loads(result.stdout)
+    tpu_info = json.loads(result.stdout)
 
-    # The status of the instance is stored in the 'status' field
-    status = instance_info.get('status')
-    if status:
-        print(f"Instance status: {status}")
-        return status
+    # return all
+
+    return tpu_info
+
+
+def get_tpu_status(zone, tpu):
+    cmd = ["gcloud", "alpha", "compute", "tpus", "tpu-vm",
+           "describe", tpu, "--zone", zone, "--format=json"]
+
+    result = subprocess.run(cmd, text=True, capture_output=True)
+
+    if result.returncode != 0:
+        print(f"Error running command: {result.stderr}")
+        return None
+
+    tpu_info = json.loads(result.stdout)
+
+    # The status of the TPU VM is stored in the 'state' field
+    state = tpu_info.get('state')
+    if state:
+        print(f"TPU VM state: {state}")
+        return state
     else:
-        print("Status not found in instance info.")
+        print("State not found in TPU VM info.")
         return None
 
 
@@ -186,62 +234,83 @@ def create_UI_tables():
     return machine_summary_table, machine_status_table
 
 
-def main():
-    ray_context = start_ray_head_node()
+def update_ui(live, machine_ids, ray_count):
     machine_summary_table, machine_status_table = create_UI_tables()
 
-    # Stores the last update time of each machine's status
-    machine_status_update_times = {}
+    # Get machine specific statuses and update the status table
+    for machine_id in machine_ids:
+        machine_status = get_tpu_status(os.environ['ZONE'], machine_id)
+        machine_status_table.add_row(machine_id, machine_status)
 
-    with Live(Group(machine_summary_table, machine_status_table), refresh_per_second=4) as live:
-        while True:
-            # clear the table for fresh data
-            machine_summary_table.rows.clear()
-            machine_status_table.rows.clear()
+    # update the summary table
+    machine_summary_table.add_row(
+        str(DEFAULT_CHILD_NODE_COUNT),
+        str(sum(1 for _ in machine_ids if get_tpu_status(
+            os.environ['ZONE'], _) == 'ERROR')),
+        str(sum(1 for _ in machine_ids if get_tpu_status(
+            os.environ['ZONE'], _) == 'PENDING')),
+        str(sum(1 for _ in machine_ids if get_tpu_status(
+            os.environ['ZONE'], _) == 'RUNNING')),
+        str(ray_count)
+    )
 
-            status = check_node_status()
-            head_node_ip = status.get('node_ip_address')
-            machine_ids = []
+    # Update the Live display
+    live.update(Group(machine_summary_table, machine_status_table))
 
-            ray_count = len(status.get('nodes', []))
-            gcp_count = get_node_count_gcp()
+    return
 
-            # Launch additional nodes if necessary
-            if DEFAULT_CHILD_NODE_COUNT > ray_count:
-                print(
-                    f"Child nodes in Ray cluster {ray_count} is less than expected {DEFAULT_CHILD_NODE_COUNT}. Launching nodes...")
-                for _ in range(DEFAULT_CHILD_NODE_COUNT - ray_count):
-                    machine_id = launch_node()
-                    machine_ids.append(machine_id)
 
-            # Get machine specific statuses and update the status table
-            for machine_id in machine_ids:
-                now = time.time()
-                last_update_time = machine_status_update_times.get(
-                    machine_id, 0)
-                # Only update the status if it was not updated in the last minute
-                if now - last_update_time > 60:
-                    machine_status = get_tpu_status(
-                        os.environ['ZONE'], machine_id)
-                    machine_status_update_times[machine_id] = now
-                else:
-                    machine_status = "Recently checked..."
-                machine_status_table.add_row(machine_id, machine_status)
+def machine_down(machine_id):
+    cmd = f"""
+    gcloud alpha compute tpus tpu-vm delete {machine_id} - -zone {os.environ['ZONE']} - -project {os.environ['PROJECT_ID']}
+    """
+    run_command_on_gcloud(cmd, zone=os.environ['ZONE'], instance=machine_id)
 
-            # update the summary table
-            machine_summary_table.add_row(str(DEFAULT_CHILD_NODE_COUNT),
-                                          str(sum(1 for _ in machine_ids if get_tpu_status(
-                                              os.environ['ZONE'], _) == 'ERROR')),
-                                          str(sum(1 for _ in machine_ids if get_tpu_status(
-                                              os.environ['ZONE'], _) == 'PENDING')),
-                                          str(sum(1 for _ in machine_ids if get_tpu_status(
-                                              os.environ['ZONE'], _) == 'RUNNING')),
-                                          str(ray_count))
 
-            # Update the Live display
-            live.update(Group(machine_summary_table, machine_status_table))
+def main():
+    ray_context = start_ray_head_node()
 
-            time.sleep(5)  # sleep for 5 seconds
+    # Get head node's IP
+    head_node_ip = ray_context['node_ip_address']
+
+    live = Live(refresh_per_second=4)
+
+    while True:
+        ray_status = check_node_status()
+        machine_ids = []
+        print("status")
+        print(ray_status)
+        ray_count = len(ray_status)
+
+        statuses = all_tpu_status(os.environ['ZONE'])
+        machine_ids = [tpu.get('name') for tpu in statuses]
+        tpu_count = len(machine_ids)
+
+        for i, tpu in enumerate(statuses):
+            print(tpu)
+            machine_id = tpu.get('name')
+            machine_status = tpu.get('status')
+
+            print(machine_id)
+
+            if machine_status == 'RUNNING':
+                if DEFAULT_CHILD_NODE_COUNT > ray_count:
+                    print("Starting ray on child")
+                    start_ray_on_child(
+                        head_node_ip, os.environ['ZONE'], machine_id)
+            # if error destroy
+            if machine_status == 'ERROR':
+                print("Machine in error state")
+                machine_down(machine_id)
+
+        if DEFAULT_CHILD_NODE_COUNT > tpu_count:
+            for i in range(DEFAULT_CHILD_NODE_COUNT - tpu_count):
+                print("Launching node")
+                launch_node()
+
+        update_ui(live, statuses, ray_count)
+
+        time.sleep(5)  # sleep for 5 seconds
 
 
 if __name__ == '__main__':

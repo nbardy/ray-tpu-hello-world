@@ -1,0 +1,4 @@
+Updated property [compute/zone].
+ERROR: (gcloud.alpha.compute.tpus.tpu-vm.delete) NOT_FOUND: Resource 'projects/facet-250518/locations/us-west4-a/nodes/nbardy-tpuv5-lite-162DE636' was not found
+- '@type': type.googleapis.com/google.rpc.ResourceInfo
+  resourceName: projects/facet-250518/locations/us-west4-a/nodes/nbardy-tpuv5-lite-162DE636
