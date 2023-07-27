@@ -1,3 +1,4 @@
+import argparse
 import logging
 import shutil
 from rich.console import Group
@@ -18,9 +19,8 @@ os.environ['ZONE'] = 'us-west4-a'
 os.environ['RUNTIME_VERSION'] = 'v2-alpha-tpuv5-lite'
 os.environ['TPU_NAME'] = 'nbardy-tpuv5-lite-' + os.environ['NUM_CHIPS']
 os.environ['QUEUED_RESOURCE_ID'] = 'nbady-tpuv5-lite-queued-resource-v2-'
-os.environ['ZONE'] + '-' + os.environ['NUM_CHIPS']
 
-DEFAULT_CHILD_NODE_COUNT = 4
+DEFAULT_CHILD_NODE_COUNT = 2
 
 compute = discovery.build('compute', 'v1')
 
@@ -46,37 +46,33 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def run_command_log(cmd, label=None, machine_id=None, retries=1):
+def run_command_log(cmd, label=None, machine_id=None):
     os.makedirs("machine_ups", exist_ok=True)
     os.makedirs("latest", exist_ok=True)
 
     log_file_path = f"machine_ups/{machine_id}.log"
     print(f"Running command: {label}")
     print("Logging to: ", log_file_path)
-    print("Command: ", cmd)
 
-    while retries:
-        process = subprocess.Popen(
-            cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    process = subprocess.Popen(
+        cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
-        with open(log_file_path, 'a') as log_file:
-            while True:
-                output = process.stdout.readline()
-                if output == b'' and process.poll() is not None:
-                    break
-                if output:
-                    print(output.strip().decode())
-                    log_file.write(output.decode())
+    with open(log_file_path, 'a') as log_file:
+        log_file.write(f"Running: {label}\n")
+        log_file.write(f"Command: {cmd}\n")
 
-        if process.poll() == 0:
-            # copy log file to latest folder
-            shutil.copy2(log_file_path, "latest/")
-            return process.stdout
-        else:
-            print(
-                f"Failed to run command: {cmd}, retrying...")
-            retries -= 1
-            time.sleep(5)
+        while True:
+            output = process.stdout.readline()
+            if output == b'' and process.poll() is not None:
+                break
+            if output:
+                # print(output.strip().decode())
+                log_file.write(output.decode())
+
+    if process.poll() == 0:
+        # copy log file to latest folder
+        shutil.copy2(log_file_path, "latest/")
+        return process.stdout
 
     # copy log file to latest folder
     shutil.copy2(log_file_path, "latest/")
@@ -96,27 +92,6 @@ def launch_node():
     set_config = f"gcloud config set compute/zone {os.environ['ZONE']} --quiet"
     run_command_log(set_config, label="Set config", machine_id=machine_id)
 
-    delete_tpu_vm = f"gcloud alpha compute tpus tpu-vm delete {tpu_name} --zone {os.environ['ZONE']} --project {os.environ['PROJECT_ID']} --quiet"
-    try:
-        run_command_log(delete_tpu_vm, label="Delete TPU VM",
-                        machine_id=machine_id)
-    except Exception as e:
-        print(e)
-
-    delete_queued_resource = f"""
-    gcloud alpha compute tpus queued-resources delete {queued_resource_id} \
-    --project {os.environ['PROJECT_ID']} \
-    --zone {os.environ['ZONE']}
-    --quiet \
-    """
-
-    # This one can fail if it doesn't exist that's ok
-    try:
-        run_command_log(delete_queued_resource, label="Delete Queued Resource",
-                        machine_id=machine_id)
-    except Exception as e:
-        print(e)
-
     create_queued_resource = f"""
     gcloud alpha compute tpus queued-resources create {queued_resource_id} \
     --project {os.environ['PROJECT_ID']} \
@@ -124,7 +99,7 @@ def launch_node():
     --zone {os.environ['ZONE']} \
     --accelerator-type {os.environ['ACCELERATOR_TYPE']} \
     --runtime-version {os.environ['RUNTIME_VERSION']} \
-    --quiet \
+    --quiet
     """
     run_command_log(create_queued_resource, label="Create Queued Resource",
                     machine_id=machine_id)
@@ -234,23 +209,19 @@ def create_UI_tables():
     return machine_summary_table, machine_status_table
 
 
-def update_ui(live, machine_ids, ray_count):
+def update_ui(live, machine_ids_statuses, ray_count):
     machine_summary_table, machine_status_table = create_UI_tables()
 
     # Get machine specific statuses and update the status table
-    for machine_id in machine_ids:
-        machine_status = get_tpu_status(os.environ['ZONE'], machine_id)
+    for machine_id, machine_status in machine_ids_statuses.items():
         machine_status_table.add_row(machine_id, machine_status)
 
     # update the summary table
     machine_summary_table.add_row(
         str(DEFAULT_CHILD_NODE_COUNT),
-        str(sum(1 for _ in machine_ids if get_tpu_status(
-            os.environ['ZONE'], _) == 'ERROR')),
-        str(sum(1 for _ in machine_ids if get_tpu_status(
-            os.environ['ZONE'], _) == 'PENDING')),
-        str(sum(1 for _ in machine_ids if get_tpu_status(
-            os.environ['ZONE'], _) == 'RUNNING')),
+        str(sum(1 for status in machine_ids_statuses.values() if status == 'ERROR')),
+        str(sum(1 for status in machine_ids_statuses.values() if status == 'PENDING')),
+        str(sum(1 for status in machine_ids_statuses.values() if status == 'RUNNING')),
         str(ray_count)
     )
 
@@ -262,56 +233,92 @@ def update_ui(live, machine_ids, ray_count):
 
 def machine_down(machine_id):
     cmd = f"""
-    gcloud alpha compute tpus tpu-vm delete {machine_id} - -zone {os.environ['ZONE']} - -project {os.environ['PROJECT_ID']}
+    gcloud alpha compute tpus tpu-vm delete {machine_id} --zone {os.environ['ZONE']} --project {os.environ['PROJECT_ID']}
     """
-    run_command_on_gcloud(cmd, zone=os.environ['ZONE'], instance=machine_id)
+    run_command(cmd, zone=os.environ['ZONE'], instance=machine_id)
 
 
-def main():
+def get_queued_resources():
+    cmd = "gcloud alpha compute tpus queued-resources list"
+    result = run_command(cmd)
+    print("result")
+    print(result)
+    queued_resources = result.split("\n")[1:]  # Skip the header
+    # Extract the NAME field
+    return [resource.split()[0] for resource in queued_resources if resource]
+
+
+def delete_queued_resource(resource_name):
+    cmd = f"""
+    gcloud alpha compute tpus queued-resources delete {resource_name} --zone {os.environ['ZONE']} --project {os.environ['PROJECT_ID']}
+    """
+    run_command(cmd)
+
+
+def ray_up():
+    # Call ray up on all available machines
     ray_context = start_ray_head_node()
-
-    # Get head node's IP
     head_node_ip = ray_context['node_ip_address']
+    statuses = all_tpu_status(os.environ['ZONE'])
+    for i, tpu in enumerate(statuses):
+        machine_id = tpu.get('name')
+        machine_status = tpu.get('status')
+        if machine_status == 'RUNNING':
+            print("Starting ray on child")
+            start_ray_on_child(head_node_ip, os.environ['ZONE'], machine_id)
 
+
+def node_up():
+    # Call node up for missing machines
+    statuses = all_tpu_status(os.environ['ZONE'])
+    machine_ids = [tpu.get('name') for tpu in statuses]
+    tpu_count = len(machine_ids)
+    if DEFAULT_CHILD_NODE_COUNT > tpu_count:
+        for i in range(DEFAULT_CHILD_NODE_COUNT - tpu_count):
+            print("Launching node")
+            launch_node()
+
+
+def status():
+    cmd = "gcloud alpha compute tpus queued-resources list"
+    run_command(cmd)
+
+    cmd = "gcloud alpha compute tpus list"
+    run_command(cmd)
+
+    cmd = "gcloud alpha compute tpus tpu-vm list"
+    run_command(cmd)
+
+    import ray
+    ray.init()
+    # Check status and print a UI
     live = Live(refresh_per_second=4)
-
     while True:
         ray_status = check_node_status()
-        machine_ids = []
         print("status")
         print(ray_status)
         ray_count = len(ray_status)
 
         statuses = all_tpu_status(os.environ['ZONE'])
         machine_ids = [tpu.get('name') for tpu in statuses]
-        tpu_count = len(machine_ids)
 
-        for i, tpu in enumerate(statuses):
-            print(tpu)
-            machine_id = tpu.get('name')
-            machine_status = tpu.get('status')
+        machine_ids_statuses = {id: get_tpu_status(
+            os.environ['ZONE'], id) for id in machine_ids}
 
-            print(machine_id)
-
-            if machine_status == 'RUNNING':
-                if DEFAULT_CHILD_NODE_COUNT > ray_count:
-                    print("Starting ray on child")
-                    start_ray_on_child(
-                        head_node_ip, os.environ['ZONE'], machine_id)
-            # if error destroy
-            if machine_status == 'ERROR':
-                print("Machine in error state")
-                machine_down(machine_id)
-
-        if DEFAULT_CHILD_NODE_COUNT > tpu_count:
-            for i in range(DEFAULT_CHILD_NODE_COUNT - tpu_count):
-                print("Launching node")
-                launch_node()
-
-        update_ui(live, statuses, ray_count)
+        update_ui(live, machine_ids_statuses, ray_count)
 
         time.sleep(5)  # sleep for 5 seconds
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("action", help="Choose action to run",
+                        choices=['ray', 'node', 'status'])
+    args = parser.parse_args()
+
+    if args.action == "ray":
+        ray_up()
+    elif args.action == "node":
+        node_up()
+    elif args.action == "status":
+        status()

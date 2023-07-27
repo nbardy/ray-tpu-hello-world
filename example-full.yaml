@@ -95,7 +95,7 @@ available_node_types:
             acceleratorType: v4-8
             runtimeVersion: tpu-vm-v4-pt-2.0
             schedulingConfig:
-                preemptible: true
+                preemptible: false
            
     ray_worker_small:
         # The minimum number of worker nodes of this type to launch.
